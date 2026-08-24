@@ -57,6 +57,58 @@ min_y  Σ w_v ||y_v − (t_v − id_v)||²  +  λ||D y||²  +  μ||y||²
 
 ---
 
+## 在 Lightroom Classic 使用 grade.cube
+
+已查證：Lightroom Classic 7.3 版起原生支援直接匯入 `.cube`，不用額外轉檔。
+
+1. Develop 模組 → Basic 面板上方的 **Profile Browser**
+2. 右上角 `+` → **Import Profiles** → 選 `grade.cube`
+3. 會出現在 Profile Browser 底下、以你匯入資料夾命名的新分類，套用方式跟套相機 profile 一樣
+
+這其實是比「preset」更合理的位置——它變成疊在其他 Develop 調整**之下**的基礎呈現，
+而不是覆蓋掉你其他設定的獨立 preset。
+
+想要更進階版本（帶白平衡感知、能配合遮罩，即 Adobe 的 "Enhanced Profile"）才需要
+額外經過 Photoshop 的 Camera Raw 濾鏡轉檔，那是加分項不是必要路徑。網格大小 17 或 33
+都在相容範圍內（Enhanced Profile 上限 32），預設的 `--size 17` 沒問題。
+
+Sources:
+- [How To Install 3D LUTs in Lightroom Classic](https://proedu.com/blogs/photoshop-skills/how-to-install-3d-luts-in-lightroom-classic-a-step-by-step-guide)
+- [How To Convert A LUT To A Lightroom Camera Profile](https://scottdavenportphoto.com/blog/how-to-convert-a-lut-to-a-lightroom-camera-profile)
+
+---
+
+## v1 範圍：不做 RAW，只吃 Lightroom 匯出的 JPG
+
+刻意的取捨，不是還沒做完：
+
+這個工具要處理的是「調色前 vs 調色後」這一層轉換，不是 RAW 解碼。
+Lightroom 自己的 Develop 引擎已經處理好 demosaic 跟色彩空間轉換了 —— 工具只要接手
+**匯出之後**的 JPG 就好，完全不用碰 RAW、不用管相機的色彩科學、不用嵌入 ICC profile 邏輯。
+
+代價是你要在匯出時保持紀律：**before/after/target 全部用同一種色彩空間匯出**
+（建議固定用 sRGB，最通用）。工具內部沒有讀 ICC profile，色彩空間不一致的話，
+`fit_lut` 學到的偏移量會是錯的，而且不會有任何錯誤訊息提醒你 —— 這是目前最大的
+「安靜失敗」風險，回家測試時務必檢查匯出設定。
+
+如果之後真的需要跳過匯出這一步、直接吃 RAW，再加 `rawpy` 不遲，但那是完全不同的
+工作量等級（demosaic、機身色彩校正、更大的檔案），不要在驗證出真正的產品價值之前碰它。
+
+---
+
+## 回家測試前：Lightroom 匯出檢查清單
+
+為了讓第一次拿真實照片測試就成功，匯出時這幾點要一致：
+
+- [ ] **色彩空間固定 sRGB**（Export 面板 → File Settings → Color Space）
+- [ ] **Before 用完全沒調過的版本**（右鍵 Develop Settings → Reset，或用尚未進 Develop 的原始匯入版本）
+- [ ] **After 用你已經調好、滿意的成品**
+- [ ] Before 跟 After **必須是同一張照片**，不要裁切、不要旋轉（尺寸不同工具會自動縮放對齊，但構圖位移會讓像素對應錯位）
+- [ ] Output Sharpening、雜訊消除等匯出時的處理，**before/after 兩邊開關要一致**（最簡單是兩邊都關），否則這些差異會被誤學成「調色風格」的一部分
+- [ ] 3–5 張同場次、涵蓋不同膚色/場景/光線的 before-after 配對會比只有 1 張準很多（見上面「色彩涵蓋率」那節），如果手上有多張都調過同一風格，一起丟進去
+
+---
+
 ## 還沒驗證的部分
 
 **曝光/白平衡正規化**（`normalize()`）只做過健全性檢查，沒有真正驗證。
@@ -89,8 +141,9 @@ uv run colormatch.py apply --cube grade.cube --input ./原始 --out ./成品 \
 
 ## 已知限制
 
-- 目前只吃 JPG/PNG/TIFF。RAW 要加 `rawpy`，且**要先決定色彩空間**
-  （sRGB / AdobeRGB / ProPhoto），這件事一開始弄錯後面全白做。
+- 只吃 JPG/PNG/TIFF，不支援 RAW（見上方「v1 範圍」— 刻意決定，不是缺陷）。
+- 不讀 ICC profile，色彩空間不一致會安靜失敗（無錯誤訊息，結果就是錯的）。
+  務必確保 before/after/target 匯出時用同一種色彩空間，見上方檢查清單。
 - 3D LUT 是全域變換，表達不了局部調整。如果你的 grade 用了遮罩或筆刷，
   擬合殘差會偏高，程式會警告 —— 那代表這張不適合當訓練配對。
 - before/after 必須是同一張、沒有裁切位移。尺寸不同會自動縮放對齊。

@@ -34,9 +34,29 @@ EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
 
 # ---------------------------------------------------------------- 影像 IO / 色彩空間
 
+_NON_SRGB_MARKERS = [b"Adobe RGB", b"ProPhoto", b"Display P3", b"Apple RGB", b"ColorMatch"]
+
+
+def _warn_if_not_srgb(path, buf):
+    """
+    粗略掃描檔案內嵌的 ICC profile 描述字串。整套工具的數學完全沒有讀取/校正
+    色彩空間，所以嵌了非 sRGB profile 的檔案會被當成 sRGB 硬算 —— 不會報錯，
+    只會讓學出來的 grade 悄悄跑掉。這裡只做得到「提醒」，做不到「校正」。
+    """
+    for marker in _NON_SRGB_MARKERS:
+        if marker in buf:
+            print(
+                f"  [!] {path} 內嵌了 {marker.decode()} 色彩描述檔，但這個工具全程假設 sRGB。"
+                f"請重新以 sRGB 匯出，否則結果不可信。",
+                file=sys.stderr,
+            )
+            return
+
+
 def imread(path):
     """讀成 RGB float [0,1]。用 fromfile 以支援非 ASCII 路徑。"""
     buf = np.fromfile(str(path), dtype=np.uint8)
+    _warn_if_not_srgb(path, buf.tobytes())
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     if img is None:
         raise SystemExit(f"讀不到影像: {path}")
