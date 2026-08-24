@@ -257,6 +257,133 @@ def normalize(img, ref_stats, strength=0.7):
     return linear_to_srgb(lin).astype(np.float32)
 
 
+# ---------------------------------------------------------------- 手刻風格 LUT（不需要 before/after 配對）
+
+_LUM = np.array([0.2126, 0.7152, 0.0722], np.float32)
+
+
+def _hsv(img):
+    """img: (...,3) RGB float32 [0,1] -> 同形狀 HSV，H 為 [0,360) 度。"""
+    shape = img.shape
+    flat = np.clip(img, 0, 1).reshape(-1, 1, 3).astype(np.float32)
+    return cv2.cvtColor(flat, cv2.COLOR_RGB2HSV).reshape(shape)
+
+
+def _hue_weight(hsv, center, width, min_sat=0.12):
+    """0~1：這個像素有多接近某個色相，同時排除接近灰階的像素（不然陰影都會被染色）。"""
+    h, s = hsv[..., 0], hsv[..., 1]
+    d = np.abs(((h - center + 180) % 360) - 180)  # 色相是環狀的，0°和 360° 相鄰
+    hue_w = np.exp(-0.5 * (d / width) ** 2)
+    sat_w = np.clip((s - min_sat) / (1 - min_sat + 1e-6), 0, 1)
+    return (hue_w * sat_w)[..., None]
+
+
+def apply_recipe(img, recipe):
+    """
+    照配方合成一個風格，純函數、不需要任何訓練資料。跟 fit_lut() 是完全不同的路：
+    那邊是從真實的 before/after 反解，這邊是照公開可考的美學特徵手刻參數。
+
+    色相判斷一律用最原始的顏色算（hsv0），不然疊了幾層調整之後色相會飄，
+    「膚色加暖」跟「綠色降飽和」這種選擇性調整就會抓錯對象。
+    """
+    x = np.clip(img, 0, 1).astype(np.float32)
+    hsv0 = _hsv(x)
+
+    lift = recipe.get("lift", 0.0)
+    if lift:
+        x = x + lift * (1 - x)  # 黑位抬升但不壓縮亮部，霧面/褪色感的來源
+
+    s = x * x * (3 - 2 * x)  # smoothstep S 曲線
+    x = x + recipe["contrast_strength"] * (s - x)
+
+    shoulder = recipe.get("shoulder", 0.0)  # 高光肩部：底片不會像數位一樣死白硬切
+    if shoulder > 0:
+        knee = 1 - shoulder
+        t = np.clip((x - knee) / shoulder, 0, 1)
+        x = np.where(x > knee, knee + shoulder * (1 - (1 - t) ** 2), x)
+
+    lum = (x @ _LUM)[..., None]
+    x = x + (1 - lum) * np.array(recipe["shadow_tint"], np.float32)
+    x = x + lum * np.array(recipe["highlight_tint"], np.float32)
+
+    gray = (x @ _LUM)[..., None]
+    x = gray + recipe.get("sat_mult", 1.0) * (x - gray)  # 整體飽和度
+
+    for key, push_key in [("skin_hue", "skin_warm_push")]:
+        if key in recipe:
+            w = _hue_weight(hsv0, recipe[key], recipe[key.replace("hue", "width")])
+            x = x + w * np.array(recipe[push_key], np.float32)
+
+    for hue_key, width_key, amt_key, sign in [
+        ("green_hue", "green_width", "green_desat", -1),
+        ("blue_hue", "blue_width", "blue_desat", -1),
+        ("red_hue", "red_width", "red_boost_sat", +1),
+    ]:
+        if hue_key in recipe:
+            w = _hue_weight(hsv0, recipe[hue_key], recipe[width_key])
+            gray_l = (x @ _LUM)[..., None]
+            x = x + w * (x - gray_l) * (sign * recipe[amt_key])
+
+    return np.clip(x, 0, 1)
+
+
+def bake_recipe_lut(recipe, n=32):
+    """在單位 LUT 的每個網格點上直接算配方，不用像 fit_lut 那樣做稀疏求解 —— 這裡沒有樣本不足的問題。"""
+    grid = _identity_lut(n).astype(np.float32)
+    lut = apply_recipe(grid.reshape(-1, 1, 3), recipe).reshape(-1, 3)
+    return np.clip(lut, 0, 1).astype(np.float32)
+
+
+def add_grain(img, amount=0.02, size=1.6):
+    """
+    簡易底片顆粒。這是空間雜訊紋理，不是顏色轉換，所以進不了 .cube —— 只能在
+    套用照片時後製加上，Lightroom 端要顆粒感得靠它自己的 Grain 面板另外加。
+    """
+    h, w = img.shape[:2]
+    rng = np.random.default_rng()
+    luma_n = rng.normal(0, 1, (h, w)).astype(np.float32)
+    if size > 1:
+        k = int(size) | 1
+        luma_n = cv2.GaussianBlur(luma_n, (k, k), 0)
+        luma_n /= luma_n.std() + 1e-6
+    chroma_n = rng.normal(0, 1, (h, w, 3)).astype(np.float32) * 0.35
+    noise = (luma_n[..., None] * 0.65 + chroma_n) * amount
+    lum = (img @ _LUM)[..., None]
+    shadow_boost = 1.3 - 0.6 * lum  # 暗部顆粒感通常比高光明顯
+    return np.clip(img + noise * shadow_boost, 0, 1)
+
+
+# 兩個起始配方 —— 照公開可查的美學特徵手刻，不是校準過真實底片掃描片的精密模擬，
+# 回家用真實照片比對、微調參數才是重點，這裡只給一個看得出方向的起點。
+RECIPES = {
+    "portra400": dict(
+        # Kodak Portra 400：人像底片，特色是寬容度高、反差低、皮膚亮部不死白、
+        # 整體偏暖但不誇張，綠/藍會自然收斂不搶戲。
+        contrast_strength=0.35,
+        shoulder=0.22,
+        shadow_tint=(0.010, 0.006, -0.006),
+        highlight_tint=(0.018, 0.010, -0.010),
+        sat_mult=0.86,
+        skin_hue=28, skin_width=22, skin_warm_push=(0.028, 0.010, -0.018),
+        green_hue=120, green_width=35, green_desat=0.35,
+        blue_hue=215, blue_width=30, blue_desat=0.20,
+    ),
+    "wkw": dict(
+        # 王家衛 / 杜可風式的 teal-orange 電影感：陰影推青、高光推暖橘、
+        # 黑位微微抬起的霧面感、紅色（旗袍/霓虹）特別飽和突出。
+        contrast_strength=0.55,
+        shoulder=0.12,
+        lift=0.035,
+        shadow_tint=(-0.030, 0.006, 0.034),
+        highlight_tint=(0.040, 0.014, -0.030),
+        sat_mult=1.08,
+        skin_hue=28, skin_width=18, skin_warm_push=(0.022, 0.004, -0.016),
+        green_hue=120, green_width=30, green_desat=0.30,
+        red_hue=0, red_width=25, red_boost_sat=0.25,
+    ),
+}
+
+
 # ---------------------------------------------------------------- 對照圖
 
 def contact_sheet(panels, path, height=420):
@@ -332,6 +459,44 @@ def cmd_apply(args):
     print(f"\n{len(files)} 張輸出到 {out_dir}/")
 
 
+def cmd_look(args):
+    if args.style not in RECIPES:
+        raise SystemExit(f"沒有這個風格：{args.style}，可用：{', '.join(RECIPES)}")
+    recipe = RECIPES[args.style]
+
+    if args.cube_out:
+        lut = bake_recipe_lut(recipe, n=args.size)
+        write_cube(args.cube_out, lut, args.size, args.style)
+        print(f"已寫出 {args.cube_out}（可直接丟進 Lightroom Profile Browser）")
+
+    def render(img):
+        out = apply_recipe(img, recipe)
+        return add_grain(out, args.grain) if args.grain else out
+
+    if args.preview:
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for p in args.preview:
+            img = imread(p)
+            path = out_dir / f"{Path(p).stem}_{args.style}.jpg"
+            contact_sheet([("原始", img), (args.style, render(img))], path)
+            print(f"  -> {path}")
+
+    if args.input and args.out:
+        files = sorted(p for p in Path(args.input).iterdir() if p.suffix.lower() in EXTS)
+        if not files:
+            raise SystemExit(f"{args.input} 裡沒有影像")
+        out_dir = Path(args.out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for p in files:
+            imwrite(out_dir / p.name, render(imread(p)))
+            print(f"  {p.name}")
+        print(f"\n{len(files)} 張輸出到 {out_dir}/")
+
+    if not (args.cube_out or args.preview or (args.input and args.out)):
+        raise SystemExit("至少要給 --cube-out、--preview 或 --input/--out 其中一種")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -358,6 +523,17 @@ def main():
     a.add_argument("--ref-before", help="正規化的基準（學習時的原檔）")
     a.add_argument("--strength", type=float, default=0.7)
     a.set_defaults(func=cmd_apply)
+
+    lk = sub.add_parser("look", help="套用手刻的風格 LUT（電影感/底片模擬，不需要 before/after 配對）")
+    lk.add_argument("--style", required=True, help=f"可用：{', '.join(RECIPES)}")
+    lk.add_argument("--cube-out", help="輸出 .cube")
+    lk.add_argument("--preview", nargs="+", help="套用到這些照片並輸出對照圖")
+    lk.add_argument("--out-dir", default="./out_looks")
+    lk.add_argument("--input", help="批次套用：輸入資料夾")
+    lk.add_argument("--out", help="批次套用：輸出資料夾")
+    lk.add_argument("--grain", type=float, default=0.0, help="底片顆粒強度（例如 0.02）；只影響 preview/批次輸出，不會進 .cube")
+    lk.add_argument("--size", type=int, default=32, help=".cube 網格邊長，預設 32（Lightroom Enhanced Profile 上限）")
+    lk.set_defaults(func=cmd_look)
 
     for p in (v, l):
         p.add_argument("--size", type=int, default=17, help="LUT 網格邊長，預設 17")
